@@ -39,11 +39,11 @@ public enum CoinTicker {
             DOGECOIN,
 //           TREZARCOIN, - not support on backend
             SYSCOIN,
-            PIVX,
+            PIVX
 //            ALQOCOIN, - not support on backend
 //            POLISCOIN, - not support on backend
 //            PHORECOIN, - not support on backend
-            RAVENCOIN,
+//            RAVENCOIN
 //            BITBAY - not support on backend
         );
     }
