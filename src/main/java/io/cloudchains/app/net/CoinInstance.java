@@ -56,6 +56,7 @@ import java.util.concurrent.atomic.AtomicInteger;
 import java.util.logging.Level;
 import java.util.logging.LogManager;
 import java.util.logging.Logger;
+import com.subgraph.orchid.encoders.Hex;
 
 public class CoinInstance {
     public static class CoinError {
@@ -138,7 +139,6 @@ public class CoinInstance {
 
         return Joiner.on(" ").join(seed);
     }
-
 	public static int getBlockCountByTicker(CoinTicker ticker) {
 		if (!blockCounts.containsKey(ticker)) {
 			return -1;
