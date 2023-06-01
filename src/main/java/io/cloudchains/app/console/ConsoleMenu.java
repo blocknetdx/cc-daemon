@@ -89,7 +89,14 @@ public class ConsoleMenu {
                         autoGenerateRPCConfig();
                         break;
                     case "--development-endpoint":
-                        App.BASE_URL = "https://utils.blocknet.org/";
+                        if (i < arguments.length - 1) {
+                            String url = arguments[i + 1];
+                            App.BASE_URL = url;
+                            i++;  // Skip the next argument since it has been consumed as the URL
+                        } else {
+                            LOGGER.log(Level.INFO, "No URL specified for --development-endpoint.");
+                        }
+                        //URL SYNTAX = "https://url.com/";
                         break;
                     case "--version":
                         LOGGER.log(Level.INFO, Version.CLIENT_VERSION);
