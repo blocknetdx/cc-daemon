@@ -1,5 +1,6 @@
 .lock/
-/bin/
 .gradle/
 .github/workflows/
+/bin/
 /build/
+/builds/
