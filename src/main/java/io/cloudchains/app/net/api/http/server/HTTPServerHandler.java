@@ -951,33 +951,61 @@ public class HTTPServerHandler extends SimpleChannelInboundHandler<FullHttpReque
 				break;
 			}
 			case "gettxout": {
-				if (params.size() != 2) {
+				if (params.size() < 2 || params.size() > 3) {
 					response.add("result", JsonNull.INSTANCE);
 					JsonObject errorJSON = new JsonObject();
 					errorJSON.addProperty("code", -1);
-					errorJSON.addProperty("message", "Usage: gettxout txid vout\n\ntxid (string, required) - The UTXO's transaction ID\nvout(numeric, required) - The UTXO's vout or n value");
+					errorJSON.addProperty("message", "Usage: gettxout txid n [include_mempool]\\n" + //
+							"\\n" + //
+							"txid (string, required) - The transaction ID\\n" + //
+							"n (numeric, required) - The vout value\\n" + //
+							"include_mempool (boolean, optional, default=true) - Whether to include the mempool (WARNING: This can block execution for several seconds)");
 
 					response.add("error", errorJSON);
 					break;
 				}
 
-				Sha256Hash reqTxid = Sha256Hash.wrap(params.get(0).getAsString());
-				int vout = params.get(1).getAsInt();
-
-				UTXO requested = null;
-
-				for (AddressBalance addressBalance : coin.getAddressKeyPairs()) {
-					for (UTXO utxo : addressBalance.getUtxos()) {
-						if (utxo.createUTXO().getHash().equals(reqTxid) && utxo.createUTXO().getIndex() == vout) {
-							requested = utxo;
-							break;
-						}
-					}
-					if (requested != null)
-						break;
+				String txid = params.get(0).getAsString();
+				int n = params.get(1).getAsInt();
+				boolean includeMempool = true;
+				if (params.size() == 3) {
+					includeMempool = params.get(2).getAsBoolean();
 				}
 
-				if (requested == null) {
+				// attempt to find UTXO in cache
+				UTXO requested = this.getUtxo(Sha256Hash.wrap(txid), n);
+
+				if (requested != null) {
+					LOGGER.log(Level.FINER, "[http-server-handler] Using cached UTXO for gettxout");
+
+					org.bitcoinj.core.UTXO utxo = requested.createUTXO();
+					JsonObject resultJSON = new JsonObject();
+
+					resultJSON.addProperty("confirmations",
+							(CoinInstance.getBlockCountByTicker(coin.getTicker()) - utxo.getHeight()) + 1);
+					resultJSON.addProperty("value", utxo.getValue().value / 100000000.0);
+
+					JsonObject scriptPubKey = new JsonObject();
+					scriptPubKey.addProperty("asm", utxo.getScript().toString());
+					scriptPubKey.addProperty("hex", new String(Hex.encode(utxo.getScript().getProgram())));
+					scriptPubKey.addProperty("reqSigs", utxo.getScript().getNumberOfSignaturesRequiredToSpend());
+
+					Script.ScriptType type = utxo.getScript().getScriptType();
+					getScriptType(scriptPubKey, type);
+
+					JsonArray addresses = new JsonArray();
+					addresses.add(utxo.getAddress());
+					scriptPubKey.add("addresses", addresses);
+
+					resultJSON.add("scriptPubKey", scriptPubKey);
+					resultJSON.addProperty("coinbase", utxo.isCoinbase());
+
+					response.add("result", resultJSON);
+					response.add("error", JsonNull.INSTANCE);
+					break;
+				}
+
+				if (!includeMempool) {
 					LOGGER.log(Level.FINER, "[http-server-handler] WARNING: Client requested UTXO that is not ours!");
 					response.add("result", JsonNull.INSTANCE);
 					JsonObject errorJSON = new JsonObject();
@@ -988,29 +1016,119 @@ public class HTTPServerHandler extends SimpleChannelInboundHandler<FullHttpReque
 					break;
 				}
 
-				org.bitcoinj.core.UTXO utxo = requested.createUTXO();
-				JsonObject resultJSON = new JsonObject();
+				// considering mempool, find/wait for the transaction
+				JsonObject transaction = null;
+				int retries = includeMempool ? 5 : 1;
+				for (int i = 0; i < retries; i++) {
+					transaction = httpClient.getTransaction(coin.getTicker(), txid, true);
+					if (transaction == null || transaction.has("result") && transaction.get("result").isJsonNull()) {
+						if (i < retries - 1) {
+							try {
+								Thread.sleep(2000);
+							} catch (Exception e) {
+							}
+							continue;
+						}
+					} else {
+						break;
+					}
+				}
 
-				resultJSON.addProperty("confirmations", (CoinInstance.getBlockCountByTicker(coin.getTicker()) - utxo.getHeight()) + 1);
-				resultJSON.addProperty("value", utxo.getValue().value / 100000000.0);
+				if (transaction == null || transaction.has("error") && !transaction.get("error").isJsonNull()) {
+					response.add("result", JsonNull.INSTANCE);
+					JsonObject errorJSON = new JsonObject();
 
-				JsonObject scriptPubKey = new JsonObject();
-				scriptPubKey.addProperty("asm", utxo.getScript().toString());
-				scriptPubKey.addProperty("hex", new String(Hex.encode(utxo.getScript().getProgram())));
-				scriptPubKey.addProperty("reqSigs", utxo.getScript().getNumberOfSignaturesRequiredToSpend());
+					errorJSON.addProperty("code", -5);
+					errorJSON.addProperty("message", "Invalid transaction ID");
+					response.add("error", errorJSON);
+					break;
+				}
 
-				Script.ScriptType type = utxo.getScript().getScriptType();
-				getScriptType(scriptPubKey, type);
+				// extract the UTXO
+				try {
+					// Note: will throw when attempting to parse a coinbase utxo (that's fine)
+					JsonObject result = transaction.getAsJsonObject("result");
+					JsonElement confirmations = result.get("confirmations");
+					JsonArray vout = result.getAsJsonArray("vout");
+					JsonObject entry = vout.get(n).getAsJsonObject();
+					JsonElement value = entry.get("value");
+					JsonObject scriptPubKey = entry.getAsJsonObject("scriptPubKey");
+					JsonArray addresses = scriptPubKey.getAsJsonArray("addresses");
 
-				JsonArray addresses = new JsonArray();
-				addresses.add(utxo.getAddress());
-				scriptPubKey.add("addresses", addresses);
+					// ensure address belongs to our wallet
+					boolean isOurs = false;
+					for (AddressBalance addressBalance : coin.getAddressKeyPairs()) {
+						String address = addressBalance.getAddress().toString();
+						for (JsonElement element : addresses.asList()) {
+							String addressOther = element.getAsString();
+							if (address.equals(addressOther)) {
+								isOurs = true;
+								break;
+							}
+						}
+					}
 
-				resultJSON.add("scriptPubKey", scriptPubKey);
-				resultJSON.addProperty("coinbase", utxo.isCoinbase());
+					if (!isOurs) {
+						LOGGER.log(Level.FINER, "[http-server-handler] WARNING: Client requested UTXO that cannot be ours!");
+						response.add("result", JsonNull.INSTANCE);
+						JsonObject errorJSON = new JsonObject();
 
-				response.add("result", resultJSON);
-				response.add("error", JsonNull.INSTANCE);
+						errorJSON.addProperty("code", -5);
+						errorJSON.addProperty("message", "Invalid or non-wallet transaction ID");
+						response.add("error", errorJSON);
+						break;
+					}
+
+					// ensure UTXO is unspent
+					// Note: this request is expensive
+					boolean unspent = false;
+					String address = addresses.asList().get(0).getAsString();
+					JsonArray utxos = httpClient.getUtxosUncached(coin.getTicker(), new String[] { address });
+					for (JsonElement utxo : utxos.asList()) {
+						String newtxid = utxo.getAsJsonObject().get("txid").getAsString();
+						int newvout = utxo.getAsJsonObject().get("vout").getAsInt();
+						if (newtxid.equals(txid) && newvout == n) {
+							unspent = true;
+							break;
+						}
+					}
+
+					if (!unspent) {
+						LOGGER.log(Level.FINER, "[http-server-handler] WARNING: Client requested UTXO that was already spent!");
+						response.add("result", JsonNull.INSTANCE);
+						JsonObject errorJSON = new JsonObject();
+
+						errorJSON.addProperty("code", -5);
+						errorJSON.addProperty("message", "Invalid or non-wallet transaction ID");
+						response.add("error", errorJSON);
+						break;
+					}
+
+					// assemble result
+					int count = 0;
+					if (confirmations != null) {
+						count = confirmations.getAsInt();
+					}
+
+					JsonObject resultJSON = new JsonObject();
+					resultJSON.addProperty("confirmations", count);
+					resultJSON.add("value", value);
+					resultJSON.add("scriptPubKey", scriptPubKey);
+					resultJSON.addProperty("coinbase", false);
+
+					response.add("result", resultJSON);
+					response.add("error", JsonNull.INSTANCE);
+				} catch (Exception e) {
+					LOGGER.log(Level.FINER, "[http-server-handler] ERROR: Error while parsing transaction!");
+
+					response.add("result", JsonNull.INSTANCE);
+					JsonObject errorJSON = new JsonObject();
+					errorJSON.addProperty("code", -1010);
+					errorJSON.addProperty("message", "Error while parsing transaction");
+
+					response.add("error", errorJSON);
+				}
+
 				break;
 			}
 			case "getnewaddress": {
